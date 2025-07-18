@@ -1,6 +1,4 @@
-# .github/workflows/release.yml
-# schedule refresh
-name: Create Release with Image
+name: 全自动魔改镜像发布
 
 on:
   workflow_dispatch:
@@ -8,286 +6,314 @@ on:
       force_build:
         description: "是否强制忽略版本判断并执行构建？"
         required: false
-        default: "false"
+        default: "true"
       manual_tag:
         description: "（可选）手动构建的 tag 名（如 20250722）"
         required: false
+        default: ""
+      selected_archs:
+        description: "（可选）要构建的架构（多个用逗号分隔，如 3566,x55,h700）"
+        required: false
+        default: ""
   schedule:
-    - cron: '0 1 * * *'   # 每天 09:00 北京时间
-    - cron: '0 13 * * *'  # 每天 21:00 北京时间
+    - cron: '0 1 * * *'
+    - cron: '0 13 * * *'
   create:
     tags:
       - 'v*'
 
 jobs:
-  build-and-release:
-    runs-on: ubuntu-latest
 
+  version-check:
+    name: 版本检测与创建发布
+    runs-on: ubuntu-latest
+    outputs:
+      LATEST_VERSION: ${{ steps.detect.outputs.LATEST_VERSION }}
+      TAG_NAME:        ${{ steps.detect.outputs.TAG_NAME }}
+      RELEASE_NAME:    ${{ steps.detect.outputs.RELEASE_NAME }}
+      SKIP_BUILD:      ${{ steps.detect.outputs.SKIP_BUILD }}
+      BUILD_ARCHS:     ${{ steps.matrix.outputs.BUILD_ARCHS }}
     steps:
-      - name: 检出仓库所有分支代码
+      - name: 🧾 检出仓库
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 从 mod-version 分支恢复 .version
-        id: restore_version
+      - name: 📂 恢复上次构建版本号
         run: |
-          git fetch origin mod-version || echo "🆕 mod-version 分支尚不存在"
-          if git show-ref --verify --quiet refs/remotes/origin/mod-version; then
-            git show origin/mod-version:.version > .version
+          echo "📥 正在尝试从 mod-version 分支恢复 .version 文件..."
+          git fetch origin mod-version || echo "⚠️ 无法获取 mod-version 分支，可能是首次构建。"
+          if git show origin/mod-version:.version > .version 2>/dev/null; then
+            echo "✅ 成功恢复 .version 文件，内容如下："
+            cat .version
           else
-            echo "🧩 尚未创建 mod-version 分支，跳过恢复"
+            echo "🆕 未检测到历史构建记录，视为首次构建。"
           fi
-          
-      # ↓ 如果是通过“新建 tag”触发的，就把这个临时 tag 删掉 ↓
-      - name: 删除手动触发标签
-        if: ${{ github.event_name == 'create' && github.ref_type == 'tag' }}
+
+      - name: 🔍 获取最新版本并判断是否跳过构建（含重试）
+        id: detect
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          # 从 GITHUB_REF 中剥离出 tag 名
-          tag=${GITHUB_REF#refs/tags/}
-          echo "🗑 删除手动触发用的标签：$tag"
-          # 删除远程 tag
-          git push origin --delete "refs/tags/$tag"
+          retry=0
+          max_retry=10
 
-      - name: 检测并比较版本（使用 mod-version 分支）
-        id: detect_version
-        run: |
-          echo "🧪 获取最新 H700 镜像信息..."
-
-          git fetch origin mod-version || echo "ℹ️ mod-version 分支尚未创建"
-          git show origin/mod-version:.version > .version.last 2>/dev/null || echo "ℹ️ 未检测到历史版本记录"
-
-          response=$(curl -s https://api.github.com/repos/ROCKNIX/distribution-nightly/releases)
-          if ! echo "$response" | jq empty >/dev/null 2>&1; then
-            echo "❌ 无法解析 JSON 响应，终止"
-            exit 1
-          fi
-
-          latest_url=$(echo "$response" | jq -r '.[0].assets[].browser_download_url' \
-            | grep 'H700' | grep 'img\.gz$' | head -n1)
-          if [[ -z "$latest_url" ]]; then
-            echo "❌ 未获取到有效的 H700 镜像 URL"
-            exit 1
-          fi
-
-          version=$(basename "$latest_url" | grep -oP '\d{8}')
-          echo "📦 最新版本号: $version"
-          echo "$version" > .version
-          echo "LATEST_VERSION=$version" >> $GITHUB_ENV
-
-          if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
-            echo "🚨 手动触发：忽略版本比较，强制构建"
+          AUTH_HEADER=""
+          if [ -n "$GH_PAT" ]; then
+            AUTH_HEADER="Authorization: token $GH_PAT"
+            echo "🔐 使用 GH_PAT 提高 API 限额"
           else
-            if [ -f .version.last ]; then
-              old_version=$(cat .version.last | tr -d '\r\n')
-              echo "📂 上次构建版本: $old_version"
-              if [ "$version" = "$old_version" ]; then
-                echo "✅ 镜像版本未更新（$version），终止 Workflow."
-                exit 78
-              fi
+            echo "⚠️ 未设置 GH_PAT，使用匿名方式（限 60 次/小时）"
+          fi
+
+          while [ $retry -lt $max_retry ]; do
+            echo "🌐 第 $((retry+1)) 次尝试获取版本号..."
+
+            resp=$(curl -sSL -H "Accept: application/vnd.github+json" \
+              ${AUTH_HEADER:+-H "$AUTH_HEADER"} \
+              https://api.github.com/repos/ROCKNIX/distribution-nightly/releases)
+
+            if [[ -z "$resp" || "$resp" == "null" ]]; then
+              echo "⚠️ 获取失败，30 秒后重试..."
+            elif echo "$resp" | grep -q "API rate limit exceeded"; then
+              echo "⛔ GitHub API 访问频率受限，60 秒后重试..."
             else
-              echo "🆕 首次构建，未检测到 .version.last"
+              url=$(echo "$resp" | jq -r '.[0].assets[].browser_download_url' | grep H700 | grep 'img\.gz$' | head -n1)
+              echo "🧪 提取到的 URL: $url"
+              if [ -n "$url" ]; then
+                ver=$(basename "$url" | grep -oP '\d{8}')
+                if [ -n "$ver" ]; then
+                  echo "📦 最新版本号：$ver"
+                  echo "LATEST_VERSION=$ver" >> "$GITHUB_OUTPUT"
+                  break
+                else
+                  echo "❌ 无法从 URL 中提取版本号"
+                fi
+              fi
+            fi
+
+            retry=$((retry+1))
+            sleep 30
+          done
+
+          if [ -z "$ver" ]; then
+            echo "❌ 最多重试 $max_retry 次仍无法获取版本号，终止。"
+            exit 1
+          fi
+
+          if [ "${{ github.event.inputs.force_build }}" != "true" ] && [ -f .version ]; then
+            old=$(cat .version)
+            echo "📁 上次构建版本：$old"
+            if [ "$old" = "$ver" ]; then
+              echo "🟡 当前版本未更新，跳过构建"
+              echo "SKIP_BUILD=true" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
           fi
+
+          echo "SKIP_BUILD=false" >> "$GITHUB_OUTPUT"
 
           if [ -n "${{ github.event.inputs.manual_tag }}" ]; then
-            tag_name="${{ github.event.inputs.manual_tag }}"
-            release_name="手动构建版本"
+            echo "TAG_NAME=${{ github.event.inputs.manual_tag }}" >> "$GITHUB_OUTPUT"
+            echo "RELEASE_NAME=手动构建成功 - $ver" >> "$GITHUB_OUTPUT"
           else
-            tag_name="auto-${version}"
-            release_name="自动构建版本 - ${version}"
+            echo "TAG_NAME=auto-$ver" >> "$GITHUB_OUTPUT"
+            echo "RELEASE_NAME=自动构建成功 - $ver" >> "$GITHUB_OUTPUT"
           fi
+          
+      - name: 🧮 解析应构建架构（含 mini）
+        id: matrix
+        run: |
+          if [ -n "${{ github.event.inputs.selected_archs }}" ]; then
+            IFS=',' read -ra base <<< "${{ github.event.inputs.selected_archs }}"
+          else
+            base=("3566" "x55" "3326" "h700")
+          fi
+      
+          result="["
+          for arch in "${base[@]}"; do
+            result+="\"$arch\",\"${arch}_mini\","
+          done
+          result="${result%,}]"
+      
+          echo "✅ 构建架构矩阵：$result"
+          echo "BUILD_ARCHS=$result" >> "$GITHUB_OUTPUT"
 
-          echo "tag_name=$tag_name" >> $GITHUB_OUTPUT
-          echo "release_name=$release_name" >> $GITHUB_OUTPUT
 
-      - name: 安装依赖项
+      - name: 获取北京时间（可选）
+        run: |
+          echo "BUILD_TIME=$(date -u -d '+8 hour' '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_ENV"
+
+      - name: 🚀 创建 GitHub 发布（空发布）
+        if: steps.detect.outputs.SKIP_BUILD != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.detect.outputs.TAG_NAME }}
+          name: "[Rocknix 镜像构建] ${{ steps.detect.outputs.LATEST_VERSION }}"
+          body: |
+            🎉 本次构建成功！
+      
+            - 版本号: **${{ steps.detect.outputs.LATEST_VERSION }}**
+            - 类型: `${{ steps.detect.outputs.RELEASE_NAME }}`
+            - 构建时间: ${{ env.BUILD_TIME }}
+      
+            📦 构建架构: `${{ steps.matrix.outputs.BUILD_ARCHS }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  build-and-upload:
+    name: 并行构建与上传
+    needs: version-check
+    if: needs.version-check.outputs.SKIP_BUILD != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: ${{ fromJson(needs.version-check.outputs.BUILD_ARCHS) }}
+  
+    steps:
+  
+      - name: 🧾 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+  
+      - name: 🔧 安装构建依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xmlstarlet jq
-
-      - name: 构建 3566 映像
+          sudo apt-get install -y xmlstarlet jq p7zip-full gh
+  
+      - name: 🔐 安装并登录 BaiduPCS-Go
         run: |
-          chmod +x ./build_3566_common.sh
-          sudo ./build_3566_common.sh
-          sudo ./build_3566_common.sh mini
-          
-          
-      - name: 构建 X55 映像
-        run: |
-          chmod +x ./build_3566_common.sh
-          sudo ./build_3566_common.sh x55
-          sudo ./build_3566_common.sh mini_x55
-          
-      - name: 构建 3326 映像
-        run: |
-          chmod +x ./build_3326_common.sh
-          sudo ./build_3326_common.sh
-          sudo ./build_3326_common.sh mini
-
-      - name: 构建 H700 映像
-        run: |
-          chmod +x ./build_h700_common.sh
-          sudo ./build_h700_common.sh
-          sudo ./build_h700_common.sh mini
-
-      - name: 提取所有镜像
-        id: extract_assets
-        run: |
-          echo "🔍 搜索所有 .img.gz 镜像文件..."
-          mapfile -t files < <(find . -type f -name '*.img.gz')
-      
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "❌ 未找到 .img.gz 镜像文件！"
-            exit 1
-          fi
-      
-          echo "📦 共找到 ${#files[@]} 个镜像文件："
-          joined_files=""
-      
-          total_size_bytes=0
-      
-          for file in "${files[@]}"; do
-            size_bytes=$(stat -c%s "$file")
-            size_mb=$(awk "BEGIN {printf \"%.2f\", $size_bytes / 1024 / 1024}")
-            echo " - $file (${size_mb} MB)"
-            total_size_bytes=$((total_size_bytes + size_bytes))
-            joined_files+="$file"$'\n'
-          done
-      
-          total_size_mb=$(awk "BEGIN {printf \"%.2f\", $total_size_bytes / 1024 / 1024}")
-          echo "📊 镜像总大小: ${total_size_mb} MB"
-      
-          echo "ASSET_PATHS<<EOF" >> $GITHUB_ENV
-          echo "$joined_files" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
-
-      - name: 安装BaiduPCS-Go
-        run: |
-          curl -LO https://github.com/qjfoidnh/BaiduPCS-Go/releases/download/v3.9.7/BaiduPCS-Go-v3.9.7-linux-amd64.zip
-          unzip BaiduPCS-Go-v3.9.7-linux-amd64.zip
-          cd BaiduPCS-Go-v3.9.7-linux-amd64
+          curl -Lo pcs.zip https://github.com/qjfoidnh/BaiduPCS-Go/releases/download/v3.9.7/BaiduPCS-Go-v3.9.7-linux-amd64.zip
+          unzip pcs.zip
+          mv BaiduPCS-Go-v3.9.7-linux-amd64/BaiduPCS-Go .
           chmod +x BaiduPCS-Go
           sudo mv BaiduPCS-Go /usr/local/bin/
-
-      - name: 登录BaiduPCS-Go
-        run: |
           BaiduPCS-Go login -cookies="${{ secrets.BAIDU_COOKIE }}"
-
-      - name: 上传所有镜像到百度云盘
+  
+      - name: 🔨 构建镜像：${{ matrix.arch }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}  # 避免使用 GITHUB_TOKEN（系统保留）
         run: |
-          echo "${{ env.ASSET_PATHS }}" > files.txt
-          echo "📁 创建网盘目录: /lcdyk有的掌机/魔改包/rocknix自动构建/${{ env.LATEST_VERSION }}"
-          BaiduPCS-Go mkdir "/lcdyk有的掌机/魔改包/rocknix自动构建/${{ env.LATEST_VERSION }}"
-          while IFS= read -r file; do
-            if [ -f "$file" ]; then
-              echo "📤 上传中: $file"
-              BaiduPCS-Go upload "$file" "/lcdyk有的掌机/魔改包/rocknix自动构建/${{ env.LATEST_VERSION }}"
+          echo "▶️ 执行构建：build_mod_img.sh ${{ matrix.arch }}"
+          chmod +x ./build_mod_img.sh
+          sudo GH_PAT="${GH_PAT}" ./build_mod_img.sh ${{ matrix.arch }}
+      
+                  
+        
+      - name: ☁️ 上传到百度云（仅非 mini）
+        if: "!endsWith(matrix.arch, '_mini')"  # 正确判断是否为非 mini
+        run: |
+          ver=${{ needs.version-check.outputs.LATEST_VERSION }}
+          echo "📁 当前构建架构：${{ matrix.arch }}"
+          echo "📦 构建产物列表："
+          
+          ls -lh *.img.gz || { echo "❌ 没有找到构建产物 *.img.gz，跳过上传"; exit 1; }
+      
+          echo "📤 开始上传非 mini 镜像到百度网盘..."
+      
+          for f in *.img.gz; do
+            if [[ "$f" == *mini* ]]; then
+              echo "⏩ 忽略 mini 镜像：$f"
             else
-              echo "⚠️ 文件不存在: $file"
+              size=$(du -h "$f" | cut -f1)
+              echo "📤 上传：$f （大小：$size）"
+              BaiduPCS-Go upload "$f" "/lcdyk有的掌机/魔改包/rocknix自动构建/$ver"
             fi
-          done < files.txt
+          done
+      
+          echo "✅ 百度网盘上传完成"
 
-      - name: 创建 Release
-        if: ${{ steps.detect_version.outputs.tag_name != '' }}
-        uses: softprops/action-gh-release@v1
+  
+      - name: 🪓 分卷并上传至 GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.detect_version.outputs.tag_name }}
-          name: ${{ steps.detect_version.outputs.release_name }}
-          draft: false
-          prerelease: false
-          body: |
-            📦 版本号：${{ env.LATEST_VERSION }}
-            ✅ 构建成功！
-
-          
-      - name: 调整镜像大小（如果镜像大于2G）
-        id: prepare_release_assets
         run: |
-          sudo apt-get update && sudo apt-get install -y p7zip-full
-      
-          max_size=$((2 * 1024 * 1024 * 1024))
-          release_files=""
-      
-          echo "${{ env.ASSET_PATHS }}" > original_files.txt
-      
-          while IFS= read -r file; do
-            [ ! -f "$file" ] && echo "❌ $file 不存在，跳过" && continue
-      
-            size=$(stat -c%s "$file")
-            if (( size > max_size )); then
-              echo "🔧 $file 超过 2GB，执行分卷压缩"
-              base_name=$(basename "$file")
-              out_dir=$(dirname "$file")
-              split_prefix="${out_dir}/${base_name}.part"
-      
-              7z a -v1900m -mx=0 "${split_prefix}.7z" "$file"
-              for part in "${split_prefix}.7z".*; do
-                release_files+="$part"$'\n'
+          tag=${{ needs.version-check.outputs.TAG_NAME }}
+          max=$((2*1024*1024*1024))
+          for f in *.img.gz; do
+            if [ $(stat -c%s "$f") -gt $max ]; then
+              echo "📏 $f 超过 2GB，执行分卷..."
+              7z a -v1900m -mx=0 "${f}.7z" "$f" && rm -f "$f"
+              for part in "${f}.7z".*; do
+                echo "⬆️ 上传分卷文件：$part"
+                gh release upload "$tag" "$part" --clobber
               done
             else
-              release_files+="$file"$'\n'
+              echo "⬆️ 上传文件：$f"
+              gh release upload "$tag" "$f" --clobber
             fi
-          done < original_files.txt
-      
-          echo "RELEASE_ASSETS<<EOF" >> $GITHUB_ENV
-          echo "$release_files" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-          
-      - name: 上传所有镜像到 Release
-        if: ${{ env.RELEASE_ASSETS != '' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          done
+
+  save-version:
+    name: 保存版本号
+    needs: 
+      - version-check
+      - build-and-upload
+    if: needs.version-check.outputs.SKIP_BUILD != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🧾 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 打印来自前一个 Job 的版本号
+        run: echo "🧾 最新版本号：${{ needs.version-check.outputs.LATEST_VERSION }}"
+
+      - name: 💾 保存当前版本号到 mod-version 分支
         run: |
-          echo "${RELEASE_ASSETS}" > upload_list.txt
-          echo "📦 准备上传以下文件到 Release："
-          cat upload_list.txt
-      
-          echo "🔧 安装 GitHub CLI..."
-          sudo apt-get update
-          sudo apt-get install -y gh
-      
-          echo "📤 开始逐个上传镜像文件到 Release..."
-          while IFS= read -r file; do
-            if [ -f "$file" ]; then
-              echo "⬆️ 正在上传: $file"
-              gh release upload "${{ steps.detect_version.outputs.tag_name }}" "$file" --clobber --repo "$GITHUB_REPOSITORY" || {
-                echo "❌ 上传失败：$file"
-              }
-            else
-              echo "⚠️ 文件不存在: $file"
-            fi
-          done < upload_list.txt
+          ver="${{ needs.version-check.outputs.LATEST_VERSION }}"
+          echo "📥 写入当前版本号 ver=$ver"
 
+          if [ -z "$ver" ]; then
+            echo "❌ 版本号为空，终止写入"
+            exit 1
+          fi
 
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: 将 .version 推送到 mod-version 分支
-        if: success() && env.LATEST_VERSION != ''
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin || true
 
-          # 拉取远程 mod-version 分支（如果存在）
-          git fetch origin mod-version || echo "🆕 mod-version 分支尚不存在"
-
-          # 切换或创建本地 mod-version 空分支（仅含 .version）
-          if git rev-parse --verify mod-version >/dev/null 2>&1; then
+          if git ls-remote --exit-code --heads origin mod-version >/dev/null; then
             git checkout mod-version
           else
             git checkout --orphan mod-version
-            git rm -rf .
+            git rm -rf . || true
           fi
 
-          # 写入并提交 .version
-          echo "${{ env.LATEST_VERSION }}" > .version
-          git add .version
-          git commit -m "🔄 保存版本号 ${{ env.LATEST_VERSION }}" --author="github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          echo "$ver" > .version
+          echo "$ver" > .version
 
-          # 强制推送至远程 mod-version 分支
-          git push origin mod-version --force
+          # 检查是否有实际变更才提交
+          if ! git diff --cached --quiet || ! git diff --quiet; then
+            git add .version
+            git commit -m "🔄 保存版本号 $ver"
+            git push origin mod-version --force
+          else
+            echo "🟢 无需提交，版本号未变更。"
+          fi
+          
+  cleanup-on-failure:
+    name: ❌ 构建失败清理
+    if: failure() && needs.version-check.outputs.SKIP_BUILD != 'true'
+    needs: 
+      - version-check
+      - build-and-upload
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🧹 清理 Release 与 tag（仅构建失败时执行）
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}  # 自定义 token，避免默认 GITHUB_TOKEN 权限限制
+        run: |
+          tag="${{ needs.version-check.outputs.TAG_NAME }}"
+          echo "🔍 检测到失败，清理 Release 和 Tag：$tag"
+  
+          echo "🗑️ 删除 Release..."
+          gh release delete "$tag" -y || echo "⚠️ Release 删除失败或不存在"
+  
+          echo "🗑️ 删除 Tag..."
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/$tag" || echo "⚠️ Tag 删除失败或不存在"
 
-          # 切回 main
-          git checkout main

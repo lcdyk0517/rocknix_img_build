@@ -234,10 +234,15 @@ jobs:
       - name: ☁️ 上传非 mini 镜像
         run: |
           ver=${{ needs.version-check.outputs.LATEST_VERSION }}
+          remote_dir="/lcdyk有的掌机/魔改包/rocknix自动构建/nightly/$ver"
+
+          echo "📁 确保远程目录存在：$remote_dir"
+          BaiduPCS-Go mkdir "$remote_dir" || echo "⚠️ 创建目录可能已存在，忽略"
+
           find ./downloaded -name '*.img.gz' | while read file; do
             if [[ "$file" != *mini* ]]; then
-              echo "⏫ 正在上传 $file"
-              BaiduPCS-Go upload "$file" "/lcdyk有的掌机/魔改包/rocknix自动构建/nightly/$ver"
+              echo "⏫ 正在上传 $file 到 $remote_dir"
+              BaiduPCS-Go upload "$file" "$remote_dir"
             fi
           done
 
@@ -246,7 +251,6 @@ jobs:
     needs: 
       - version-check
       - upload-to-baidu
-      - build-and-package
     if: needs.version-check.outputs.SKIP_BUILD != 'true'
     runs-on: ubuntu-latest
     steps:
@@ -297,6 +301,7 @@ jobs:
     needs: 
       - version-check
       - upload-to-baidu
+      - build-and-package
     runs-on: ubuntu-latest
     steps:
       - name: 🧹 清理 Release 与 tag（仅构建失败时执行）

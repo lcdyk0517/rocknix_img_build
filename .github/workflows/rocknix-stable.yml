@@ -234,10 +234,15 @@ jobs:
       - name: ☁️ 上传非 mini 镜像
         run: |
           ver=${{ needs.version-check.outputs.LATEST_VERSION }}
+          remote_dir="/lcdyk有的掌机/魔改包/rocknix自动构建/stable/$ver"
+
+          echo "📁 确保远程目录存在：$remote_dir"
+          BaiduPCS-Go mkdir "$remote_dir" || echo "⚠️ 创建目录可能已存在，忽略"
+
           find ./downloaded -name '*.img.gz' | while read file; do
             if [[ "$file" != *mini* ]]; then
-              echo "⏫ 正在上传 $file"
-              BaiduPCS-Go upload "$file" "/lcdyk有的掌机/魔改包/rocknix自动构建/stable/$ver"
+              echo "⏫ 正在上传 $file 到 $remote_dir"
+              BaiduPCS-Go upload "$file" "$remote_dir"
             fi
           done
 
@@ -263,7 +268,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin || true
-
+      
           if git ls-remote --exit-code --heads origin mod-version >/dev/null; then
             git checkout mod-version
           else
@@ -272,15 +277,24 @@ jobs:
           fi
 
           touch .version
+      
+          # 原始文件备份以便后续 diff
+          cp .version .version.bak || true
+      
           if grep -q "^$key:" .version; then
             sed -i "s/^$key:.*/$key:$ver/" .version
           else
             echo "$key:$ver" >> .version
           fi
-
-          git add .version
-          git commit -m "🔄 更新版本号 $key:$ver"
-          git push origin mod-version --force
+      
+          # 如果内容有变动才提交
+          if ! cmp -s .version .version.bak; then
+            git add .version
+            git commit -m "🔄 更新版本号 $key:$ver"
+            git push origin mod-version --force
+          else
+            echo "✅ 版本号未变化（$key:$ver），跳过提交。"
+          fi
 
   cleanup-on-failure:
     name: ❌ 构建失败清理

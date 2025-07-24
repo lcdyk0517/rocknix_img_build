@@ -213,7 +213,9 @@ jobs:
           done
   upload-to-baidu:
     name: ☁️ 上传所有非 mini 镜像
-    needs: build-and-package
+    needs: 
+      - build-and-package
+      - version-check
     runs-on: ubuntu-latest
     if: success() && needs.version-check.outputs.SKIP_BUILD != 'true'
     steps:
@@ -233,7 +235,7 @@ jobs:
 
       - name: ☁️ 上传非 mini 镜像
         run: |
-          ver=${{ needs.version-check.outputs.LATEST_VERSION }}
+          ver="${{ needs.version-check.outputs.LATEST_VERSION }}"
           remote_dir="/lcdyk有的掌机/魔改包/rocknix自动构建/stable/$ver"
 
           echo "📁 确保远程目录存在：$remote_dir"
